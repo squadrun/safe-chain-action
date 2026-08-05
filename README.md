@@ -110,7 +110,7 @@ from this one.
 Standalone use, in a workflow of your own:
 
 ```yaml
-- uses: actions/setup-node@v4          # toolchain FIRST
+- uses: actions/setup-node@v7          # toolchain FIRST
   with:
     node-version-file: .nvmrc
 - uses: squadrun/safe-chain-action@<commit-sha>
