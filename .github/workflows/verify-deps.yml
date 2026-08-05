@@ -37,10 +37,18 @@ on:
         type: string
         default: "."
       node-version-file:
-        description: "Node version file (ecosystem: node)."
+        description: >-
+          Node version file (ecosystem: node), e.g. `.nvmrc`. Takes precedence
+          over `node-version`. Leave empty for repositories that don't pin one.
         required: false
         type: string
-        default: ".nvmrc"
+        default: ""
+      node-version:
+        description: >-
+          Node version to use (ecosystem: node) when `node-version-file` is empty.
+        required: false
+        type: string
+        default: "lts/*"
       python-version-file:
         description: "Python version file (ecosystem: uv | pip)."
         required: false
@@ -201,11 +209,20 @@ jobs:
       # and with dependency caching OFF. A cache hit means zero registry
       # traffic, which means Safe Chain inspects nothing and the job passes
       # vacuously — the worst possible outcome for a security gate.
-      - name: Set up Node.js
-        if: steps.detect.outputs.changed == 'true' && inputs.ecosystem == 'node'
+      # Two mutually exclusive steps rather than passing both inputs: setup-node
+      # gives node-version precedence over node-version-file, which would silently
+      # ignore a repository's pinned .nvmrc.
+      - name: Set up Node.js from version file
+        if: steps.detect.outputs.changed == 'true' && inputs.ecosystem == 'node' && inputs.node-version-file != ''
         uses: actions/setup-node@v7
         with:
           node-version-file: ${{ inputs.node-version-file }}
+
+      - name: Set up Node.js
+        if: steps.detect.outputs.changed == 'true' && inputs.ecosystem == 'node' && inputs.node-version-file == ''
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ inputs.node-version }}
 
       - name: Set up Python
         if: steps.detect.outputs.changed == 'true' && (inputs.ecosystem == 'uv' || inputs.ecosystem == 'pip')
