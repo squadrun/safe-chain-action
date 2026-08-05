@@ -1,0 +1,9 @@
+# actionlint config.
+#
+# job.workflow_sha is documented in the GitHub Actions contexts reference but is
+# missing from actionlint's built-in context schema (as of 1.7.7), so it reports
+# a false positive. Nothing to fix in the workflow.
+paths:
+  .github/workflows/verify-deps.yml:
+    ignore:
+      - 'property "workflow_sha" is not defined in object type'

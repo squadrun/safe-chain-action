@@ -1,0 +1,188 @@
+name: "Setup Aikido Safe Chain"
+description: >-
+  Install Aikido Safe Chain in CI with a pinned, checksum-verified installer, then
+  verify the package-manager shims are actually active before any install runs.
+author: "squadrun"
+
+branding:
+  icon: "shield"
+  color: "blue"
+
+inputs:
+  version:
+    description: "Safe Chain release tag to install (pinned; bump deliberately)."
+    required: false
+    default: "1.5.14"
+  installer-sha256:
+    description: >-
+      Expected SHA-256 of install-safe-chain.sh for `version`. Must be updated
+      whenever `version` changes. A mismatch fails the build.
+    required: false
+    default: "d41816ab564e9b9238946786433eec15e2d0e699698fa81c1fd1bdd3a78adf5c"
+  require-shims:
+    description: >-
+      Space-separated package managers that MUST be shimmed for this job to be
+      meaningful (e.g. "yarn", "uv", "pip"). If any is missing from PATH, or is
+      present but resolves outside the shims directory, the action fails.
+    required: true
+  minimum-package-age-hours:
+    description: "Block packages published more recently than this. 0 disables the check."
+    required: false
+    default: "48"
+  age-exclusions:
+    description: >-
+      Comma-separated packages exempt from the minimum-age check, for legitimate
+      fresh releases. Prefer this over lowering minimum-package-age-hours.
+    required: false
+    default: ""
+  logging:
+    description: "Safe Chain log verbosity: silent | normal | verbose."
+    required: false
+    default: "verbose"
+  log-file:
+    description: "Path for the Safe Chain log file. Upload this on failure."
+    required: false
+    default: ""
+
+outputs:
+  log-file:
+    description: "Resolved path of the Safe Chain log file."
+    value: ${{ steps.config.outputs.log-file }}
+  shims-dir:
+    description: "Directory containing the active package-manager shims."
+    value: ${{ steps.verify.outputs.shims-dir }}
+
+runs:
+  using: "composite"
+  steps:
+    # Step 1 and 2 are deliberately separate from step 3: setup-ci publishes the
+    # shims directory via $GITHUB_PATH, which the runner only applies to
+    # SUBSEQUENT steps. Verifying in the install step would test the old PATH.
+    - name: Download Safe Chain installer
+      shell: bash
+      env:
+        SC_VERSION: ${{ inputs.version }}
+        SC_SHA256: ${{ inputs.installer-sha256 }}
+      run: |
+        set -euo pipefail
+        installer="${RUNNER_TEMP}/install-safe-chain.sh"
+        url="https://github.com/AikidoSec/safe-chain/releases/download/${SC_VERSION}/install-safe-chain.sh"
+
+        echo "Downloading Safe Chain ${SC_VERSION} installer"
+        curl -fsSL --retry 3 --retry-delay 2 "$url" -o "$installer"
+
+        if command -v sha256sum >/dev/null 2>&1; then
+          actual="$(sha256sum "$installer" | cut -d' ' -f1)"
+        else
+          actual="$(shasum -a 256 "$installer" | cut -d' ' -f1)"
+        fi
+
+        # Upstream's own installer only warns on problems. We refuse to proceed.
+        if [ "$actual" != "$SC_SHA256" ]; then
+          echo "::error title=Safe Chain installer checksum mismatch::Expected ${SC_SHA256}, got ${actual} for ${url}. Either the release was altered or the pinned installer-sha256 is stale after a version bump. Refusing to execute."
+          exit 1
+        fi
+        echo "Checksum verified: ${actual}"
+
+    - name: Install Safe Chain (CI shims)
+      shell: bash
+      run: |
+        set -euo pipefail
+        installer="${RUNNER_TEMP}/install-safe-chain.sh"
+        # --ci installs PATH shims instead of shell aliases, and appends the
+        # shims dir to $GITHUB_PATH. Uses a standalone binary, so no Node needed.
+        sh "$installer" --ci
+        rm -f "$installer"
+
+    - name: Verify shims are active
+      id: verify
+      shell: bash
+      env:
+        REQUIRE_SHIMS: ${{ inputs.require-shims }}
+      run: |
+        set -euo pipefail
+
+        if ! command -v safe-chain >/dev/null 2>&1; then
+          echo "::error title=Safe Chain not on PATH::The installer ran but 'safe-chain' is not on PATH. setup-ci failed to publish \$GITHUB_PATH; upstream only warns about this, so the job would otherwise scan nothing and pass."
+          exit 1
+        fi
+
+        sc_bin="$(command -v safe-chain)"
+        shims_dir="$(cd "$(dirname "$sc_bin")/../shims" 2>/dev/null && pwd || true)"
+        if [ -z "$shims_dir" ] || [ ! -d "$shims_dir" ]; then
+          echo "::error title=Shims directory missing::Could not locate a shims directory next to ${sc_bin}."
+          exit 1
+        fi
+        echo "shims-dir=${shims_dir}" >>"$GITHUB_OUTPUT"
+        echo "safe-chain: $(safe-chain --version 2>/dev/null || echo unknown) at ${sc_bin}"
+        echo "shims dir:  ${shims_dir}"
+        echo
+
+        missing=""
+        hijacked=""
+        for tool in $REQUIRE_SHIMS; do
+          resolved="$(command -v "$tool" 2>/dev/null || true)"
+          if [ -z "$resolved" ]; then
+            missing="${missing} ${tool}"
+            continue
+          fi
+          case "$resolved" in
+            "$shims_dir"/*)
+              echo "  shimmed      ${tool} -> ${resolved}" ;;
+            *)
+              echo "  NOT shimmed  ${tool} -> ${resolved}"
+              hijacked="${hijacked} ${tool}" ;;
+          esac
+        done
+
+        # Anything else on the runner that Safe Chain could have covered. Informational
+        # only: an unshimmed npx or python3 does not invalidate a yarn/uv scan.
+        for tool in npm npx yarn pnpm pnpx bun bunx uv uvx pip pip3 poetry pipx pdm; do
+          case " $REQUIRE_SHIMS " in *" $tool "*) continue ;; esac
+          resolved="$(command -v "$tool" 2>/dev/null || true)"
+          [ -n "$resolved" ] || continue
+          case "$resolved" in
+            "$shims_dir"/*) ;;
+            *) echo "  (info) ${tool} present but not shimmed -> ${resolved}" ;;
+          esac
+        done
+        echo
+
+        if [ -n "$missing" ]; then
+          echo "::error title=Required package manager not installed::Required shim(s) for:${missing} but those tools are not on PATH at all. Install the toolchain (setup-node / setup-uv / setup-python) BEFORE this action, or correct the require-shims input."
+          exit 1
+        fi
+
+        if [ -n "$hijacked" ]; then
+          echo "::error title=Safe Chain shims are being shadowed::These tools resolve outside ${shims_dir}:${hijacked}. \$GITHUB_PATH entries from a LATER step take precedence, so a setup-node / setup-uv / setup-python step is winning the PATH race and their installs would bypass Safe Chain entirely. Move this action AFTER all toolchain setup steps."
+          exit 1
+        fi
+
+        echo "All required package managers are routed through Safe Chain."
+
+    - name: Export Safe Chain configuration
+      id: config
+      shell: bash
+      env:
+        SC_LOGGING: ${{ inputs.logging }}
+        SC_LOG_FILE: ${{ inputs.log-file }}
+        SC_MIN_AGE: ${{ inputs.minimum-package-age-hours }}
+        SC_AGE_EXCLUSIONS: ${{ inputs.age-exclusions }}
+      run: |
+        set -euo pipefail
+        log_file="${SC_LOG_FILE:-${RUNNER_TEMP}/safe-chain.log}"
+
+        {
+          echo "SAFE_CHAIN_LOGGING=${SC_LOGGING}"
+          echo "SAFE_CHAIN_LOG_FILE=${log_file}"
+          echo "SAFE_CHAIN_LOG_FILE_FORMAT=plain"
+          echo "SAFE_CHAIN_LOG_FILE_VERBOSITY=verbose"
+          echo "SAFE_CHAIN_MINIMUM_PACKAGE_AGE_HOURS=${SC_MIN_AGE}"
+        } >>"$GITHUB_ENV"
+
+        if [ -n "$SC_AGE_EXCLUSIONS" ]; then
+          echo "SAFE_CHAIN_MINIMUM_PACKAGE_AGE_EXCLUSIONS=${SC_AGE_EXCLUSIONS}" >>"$GITHUB_ENV"
+        fi
+
+        echo "log-file=${log_file}" >>"$GITHUB_OUTPUT"
+        echo "Logging to ${log_file} (minimum package age: ${SC_MIN_AGE}h)"

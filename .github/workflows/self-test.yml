@@ -1,0 +1,209 @@
+name: Self test
+
+# Proves the action actually blocks, and that its guards actually fire.
+#
+# The failure mode this repository exists to prevent is a SILENT NO-OP: Safe
+# Chain's own installer only warns when setup-ci fails, so a misconfigured job
+# scans nothing and reports green. A green "it installed fine" test cannot
+# distinguish working protection from no protection. So every test below asserts
+# on a *negative*: a malicious package must be blocked, and each guard must fail
+# when its precondition is violated.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # Daily, to catch upstream drift in the pinned release.
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dep-path-matcher:
+    name: dep-path matcher unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run unit tests
+        run: bash tests/test-dep-path-matcher.sh
+
+  blocks-malicious-npm-package:
+    name: blocks malicious npm package
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Set up Safe Chain
+        uses: ./
+        with:
+          require-shims: "npm"
+          log-file: ${{ runner.temp }}/safe-chain.log
+
+      - name: Install the official canary package (must fail)
+        id: canary
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          mkdir -p "${RUNNER_TEMP}/canary"
+          cd "${RUNNER_TEMP}/canary"
+          npm init -y >/dev/null
+          # safe-chain-test is Aikido's own always-flagged test package.
+          npm install safe-chain-test 2>&1 | tee "${RUNNER_TEMP}/canary.out"
+
+      - name: Assert the canary was blocked
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.canary.outcome }}" != "failure" ]; then
+            echo "::error title=Safe Chain did not block the canary::'npm install safe-chain-test' exited 0. The shims are installed but not blocking, so every consuming repository's gate is a no-op. Do not ship this version."
+            exit 1
+          fi
+          if ! grep -qi 'malicious' "${RUNNER_TEMP}/canary.out"; then
+            echo "::error title=Unexpected failure reason::The install failed, but not because Safe Chain detected malware. The gate may be failing for an unrelated reason and would mask real detections."
+            cat "${RUNNER_TEMP}/canary.out"
+            exit 1
+          fi
+          if [ -d "${RUNNER_TEMP}/canary/node_modules/safe-chain-test" ]; then
+            echo "::error title=Malicious package was installed anyway::Safe Chain reported a block but the package landed on disk."
+            exit 1
+          fi
+          echo "Canary blocked, and not present on disk."
+
+  allows-clean-npm-install:
+    name: allows clean npm install
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Set up Safe Chain
+        uses: ./
+        with:
+          require-shims: "npm"
+          log-file: ${{ runner.temp }}/safe-chain.log
+
+      - name: Install a known-good, long-published package
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/clean"
+          cd "${RUNNER_TEMP}/clean"
+          npm init -y >/dev/null
+          npm install lodash@4.17.21
+          test -d node_modules/lodash
+
+      - name: Assert Safe Chain actually inspected something
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/safe-chain.log"
+          if [ ! -s "$log" ]; then
+            echo "::error title=Empty Safe Chain log::The install succeeded but Safe Chain logged nothing, so we cannot show that any package was inspected. A pass with zero packages inspected is not a pass."
+            exit 1
+          fi
+          tail -n 20 "$log"
+
+  allows-clean-uv-install:
+    name: allows clean uv install
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: false
+
+      - name: Set up Safe Chain
+        uses: ./
+        with:
+          require-shims: "uv"
+          log-file: ${{ runner.temp }}/safe-chain.log
+
+      - name: Install a known-good PyPI package through uv
+        run: |
+          set -euo pipefail
+          cd "${RUNNER_TEMP}"
+          uv venv sc-venv
+          uv pip install --python sc-venv/bin/python requests==2.32.3
+
+  fails-on-bad-installer-checksum:
+    name: fails on bad installer checksum
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run with a deliberately wrong checksum (must fail)
+        id: badsum
+        continue-on-error: true
+        uses: ./
+        with:
+          require-shims: "npm"
+          installer-sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+
+      - name: Assert the checksum guard fired
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.badsum.outcome }}" != "failure" ]; then
+            echo "::error title=Checksum guard did not fire::The action accepted an installer whose SHA-256 did not match. Upstream's installer only warns; ours must refuse."
+            exit 1
+          fi
+          echo "Checksum mismatch correctly refused."
+
+  fails-when-shims-are-shadowed:
+    name: fails when shims are shadowed
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Set up Safe Chain (expected to pass)
+        uses: ./
+        with:
+          require-shims: "npm"
+
+      - name: Simulate a toolchain step running after Safe Chain
+        run: |
+          set -euo pipefail
+          # Reproduces the real ordering bug: $GITHUB_PATH entries added by a LATER
+          # step take precedence, so a setup-* action placed after Safe Chain
+          # shadows the shims and its installs bypass scanning entirely.
+          mkdir -p "${RUNNER_TEMP}/fakebin"
+          printf '#!/bin/sh\nexec /usr/bin/env true\n' >"${RUNNER_TEMP}/fakebin/npm"
+          chmod +x "${RUNNER_TEMP}/fakebin/npm"
+          echo "${RUNNER_TEMP}/fakebin" >>"$GITHUB_PATH"
+
+      - name: Re-run the action with npm shadowed (must fail)
+        id: shadowed
+        continue-on-error: true
+        uses: ./
+        with:
+          require-shims: "npm"
+
+      - name: Assert the shadowing guard fired
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.shadowed.outcome }}" != "failure" ]; then
+            echo "::error title=Shadowing guard did not fire::npm resolved outside the shims directory and the action still passed. Consuming repositories could silently scan nothing."
+            exit 1
+          fi
+          echo "Shadowed shim correctly refused."

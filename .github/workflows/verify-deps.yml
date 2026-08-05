@@ -1,0 +1,315 @@
+name: Verify dependencies
+
+# Reusable supply-chain gate. Callers invoke this from an UNFILTERED
+# `on: pull_request` trigger; the job early-exits green when no dependency file
+# changed. A `paths:`-filtered workflow never reports a status at all, which
+# would deadlock every PR once this is a required check.
+
+on:
+  workflow_call:
+    inputs:
+      ecosystem:
+        description: "Toolchain to set up: node | uv | pip"
+        required: true
+        type: string
+      install-command:
+        description: "Install command to run under Safe Chain, e.g. 'yarn install --immutable'."
+        required: true
+        type: string
+      require-shims:
+        description: >-
+          Space-separated package managers that must be shimmed. Derived from
+          `ecosystem` when omitted.
+        required: false
+        type: string
+        default: ""
+      dep-paths:
+        description: >-
+          Newline-separated globs identifying dependency files. A change to any of
+          them triggers a scan. Matching uses shell case globs, where `*` also
+          crosses `/` — deliberately over-matching, since a spurious scan is
+          cheaper than a missed one.
+        required: true
+        type: string
+      working-directory:
+        description: "Directory to run the install command in."
+        required: false
+        type: string
+        default: "."
+      node-version-file:
+        description: "Node version file (ecosystem: node)."
+        required: false
+        type: string
+        default: ".nvmrc"
+      python-version-file:
+        description: "Python version file (ecosystem: uv | pip)."
+        required: false
+        type: string
+        default: ".python-version"
+      safe-chain-version:
+        description: "Safe Chain release tag."
+        required: false
+        type: string
+        default: "1.5.14"
+      safe-chain-installer-sha256:
+        description: "Expected SHA-256 of the Safe Chain installer for that version."
+        required: false
+        type: string
+        default: "d41816ab564e9b9238946786433eec15e2d0e699698fa81c1fd1bdd3a78adf5c"
+      minimum-package-age-hours:
+        description: "Block packages published more recently than this."
+        required: false
+        type: number
+        default: 48
+      age-exclusions:
+        description: "Comma-separated packages exempt from the minimum-age check."
+        required: false
+        type: string
+        default: ""
+      action-ref:
+        description: >-
+          Ref of squadrun/safe-chain-action to load the composite action from.
+          Defaults to this reusable workflow's own commit, so the two can never
+          drift. Only set this to work around a resolution problem.
+        required: false
+        type: string
+        default: ""
+      runs-on:
+        description: "Runner label."
+        required: false
+        type: string
+        default: "ubuntu-latest"
+      timeout-minutes:
+        description: "Job timeout."
+        required: false
+        type: number
+        default: 20
+
+permissions:
+  contents: read
+
+jobs:
+  # NOTE: this job name is half of the branch-protection check name
+  # ("<caller job id> / safe-chain"). Renaming it silently detaches the required
+  # check and every PR goes green. Don't.
+  safe-chain:
+    name: safe-chain
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # Local `uses: ./` inside a reusable workflow resolves against the CALLER's
+      # workspace, not this repository, so the action has to be checked out
+      # explicitly. job.workflow_sha is this reusable workflow's own commit, which
+      # ties the action to exactly the version the caller pinned — they can never
+      # drift apart. Checked out before the change detection below, which uses the
+      # unit-tested matcher script from this repository.
+      - name: Resolve Safe Chain action ref
+        id: action-ref
+        env:
+          OVERRIDE: ${{ inputs.action-ref }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          ref="${OVERRIDE:-$WORKFLOW_SHA}"
+          if [ -z "$ref" ]; then
+            echo "::error title=Cannot resolve the Safe Chain action ref::job.workflow_sha was empty and no action-ref input was given. Pass action-ref explicitly (a commit SHA of squadrun/safe-chain-action) to unblock."
+            exit 1
+          fi
+          echo "value=${ref}" >>"$GITHUB_OUTPUT"
+          echo "Loading squadrun/safe-chain-action@${ref}"
+
+      - name: Check out Safe Chain action
+        uses: actions/checkout@v4
+        with:
+          repository: squadrun/safe-chain-action
+          ref: ${{ steps.action-ref.outputs.value }}
+          path: .safe-chain-action
+          persist-credentials: false
+
+      - name: Detect dependency changes
+        id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEP_PATHS: ${{ inputs.dep-paths }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" != "pull_request" ] && [ "$EVENT_NAME" != "pull_request_target" ]; then
+            echo "Event '${EVENT_NAME}' is not a pull request — scanning everything."
+            echo "changed=true" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Ask the API for the changed files rather than deepening the clone;
+          # a fetch-depth: 0 checkout is expensive on large repos.
+          if ! files="$(gh pr diff "$PR_NUMBER" --repo "$REPO" --name-only)"; then
+            echo "::warning title=Could not list changed files::Falling back to a full scan."
+            echo "changed=true" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Unit-tested in tests/test-dep-path-matcher.sh — a false "no changes"
+          # here would silently skip the scan on a real dependency bump.
+          matched="$(printf '%s\n' "$files" | bash .safe-chain-action/scripts/match-dep-paths.sh)"
+
+          if [ -z "$matched" ]; then
+            echo "changed=false" >>"$GITHUB_OUTPUT"
+            echo "No dependency files changed in this pull request. Nothing to scan."
+            {
+              echo "### Safe Chain: skipped"
+              echo
+              echo "No dependency manifest or lockfile changed in this pull request."
+            } >>"$GITHUB_STEP_SUMMARY"
+          else
+            echo "changed=true" >>"$GITHUB_OUTPUT"
+            echo "Dependency files changed:"
+            printf '%s' "$matched" | sed 's/^/  /'
+          fi
+
+      - name: Resolve required shims
+        id: shims
+        if: steps.detect.outputs.changed == 'true'
+        env:
+          ECOSYSTEM: ${{ inputs.ecosystem }}
+          OVERRIDE: ${{ inputs.require-shims }}
+        run: |
+          set -euo pipefail
+          if [ -n "$OVERRIDE" ]; then
+            shims="$OVERRIDE"
+          else
+            case "$ECOSYSTEM" in
+              node) shims="npm yarn" ;;
+              uv)   shims="uv" ;;
+              pip)  shims="pip" ;;
+              *) echo "::error title=Unknown ecosystem::'${ECOSYSTEM}' is not one of: node, uv, pip."; exit 1 ;;
+            esac
+          fi
+          echo "value=${shims}" >>"$GITHUB_OUTPUT"
+          echo "Requiring shims for: ${shims}"
+
+      # Toolchain setup runs BEFORE Safe Chain so the shims win the PATH race,
+      # and with dependency caching OFF. A cache hit means zero registry
+      # traffic, which means Safe Chain inspects nothing and the job passes
+      # vacuously — the worst possible outcome for a security gate.
+      - name: Set up Node.js
+        if: steps.detect.outputs.changed == 'true' && inputs.ecosystem == 'node'
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: ${{ inputs.node-version-file }}
+
+      - name: Set up Python
+        if: steps.detect.outputs.changed == 'true' && (inputs.ecosystem == 'uv' || inputs.ecosystem == 'pip')
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: ${{ inputs.python-version-file }}
+
+      - name: Set up uv
+        if: steps.detect.outputs.changed == 'true' && inputs.ecosystem == 'uv'
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: false
+
+      - name: Set up Safe Chain
+        if: steps.detect.outputs.changed == 'true'
+        uses: ./.safe-chain-action
+        with:
+          version: ${{ inputs.safe-chain-version }}
+          installer-sha256: ${{ inputs.safe-chain-installer-sha256 }}
+          require-shims: ${{ steps.shims.outputs.value }}
+          minimum-package-age-hours: ${{ inputs.minimum-package-age-hours }}
+          age-exclusions: ${{ inputs.age-exclusions }}
+          log-file: ${{ runner.temp }}/safe-chain.log
+
+      - name: Install dependencies under Safe Chain
+        id: install
+        if: steps.detect.outputs.changed == 'true'
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          INSTALL_COMMAND: ${{ inputs.install-command }}
+        run: |
+          set -euo pipefail
+          echo "Running: ${INSTALL_COMMAND}"
+          bash -c "$INSTALL_COMMAND"
+
+      - name: Confirm packages were actually inspected
+        if: steps.detect.outputs.changed == 'true' && steps.install.outcome == 'success'
+        env:
+          LOG_FILE: ${{ runner.temp }}/safe-chain.log
+        run: |
+          set -euo pipefail
+          # A green run that inspected nothing looks identical to a green run that
+          # inspected everything, unless we check. Usually means a dependency
+          # cache leaked back into this job.
+          if [ ! -s "$LOG_FILE" ]; then
+            echo "::warning title=Safe Chain produced no log::Could not confirm that any package was inspected. Verify that no dependency cache is short-circuiting the install."
+            exit 0
+          fi
+          {
+            echo "### Safe Chain: no malicious packages detected"
+            echo
+            echo '```'
+            tail -n 25 "$LOG_FILE"
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Safe Chain log
+        if: failure() && steps.detect.outputs.changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: safe-chain-log
+          path: ${{ runner.temp }}/safe-chain.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Report blocked packages on the pull request
+        if: failure() && steps.detect.outputs.changed == 'true' && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LOG_FILE: ${{ runner.temp }}/safe-chain.log
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          MIN_AGE: ${{ inputs.minimum-package-age-hours }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          marker="<!-- safe-chain-gate -->"
+
+          details="Safe Chain produced no log output. See the job log for details."
+          if [ -s "$LOG_FILE" ]; then
+            details="$(grep -A 20 -i 'malicious changes detected' "$LOG_FILE" || tail -n 40 "$LOG_FILE")"
+          fi
+
+          # Built with printf rather than an indented heredoc so the rendered
+          # comment carries no stray leading whitespace.
+          body_file="${RUNNER_TEMP}/safe-chain-comment.md"
+          {
+            printf '%s\n' "$marker"
+            printf '## :no_entry: Safe Chain blocked this dependency change\n\n'
+            printf 'A package in this pull request'"'"'s dependency tree was flagged as malicious, or was published within the last %s hours.\n\n' "$MIN_AGE"
+            printf '```\n%s\n```\n\n' "$details"
+            printf '**If this is a real detection**, do not merge. Revert the dependency change and report it.\n\n'
+            printf '**If this is a legitimate brand-new release**, add the package to the `age-exclusions` input in this repository'"'"'s `supply-chain.yml` rather than lowering `minimum-package-age-hours`.\n\n'
+            printf '[Full run log and artifact](%s)\n' "$RUN_URL"
+          } >"$body_file"
+
+          # Edit the existing comment instead of stacking one per re-run.
+          existing="$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
+            --jq "[.[] | select(.body | contains(\"${marker}\"))] | first | .id // empty")"
+
+          if [ -n "$existing" ]; then
+            gh api --method PATCH "repos/${REPO}/issues/comments/${existing}" -F body=@"$body_file" >/dev/null
+            echo "Updated existing Safe Chain comment ${existing}."
+          else
+            gh api --method POST "repos/${REPO}/issues/${PR_NUMBER}/comments" -F body=@"$body_file" >/dev/null
+            echo "Posted Safe Chain comment."
+          fi
