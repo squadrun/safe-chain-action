@@ -264,7 +264,7 @@ jobs:
 
       - name: Upload Safe Chain log
         if: failure() && steps.detect.outputs.changed == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: safe-chain-log
           path: ${{ runner.temp }}/safe-chain.log
