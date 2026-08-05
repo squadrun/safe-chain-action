@@ -102,7 +102,7 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # Local `uses: ./` inside a reusable workflow resolves against the CALLER's
       # workspace, not this repository, so the action has to be checked out
@@ -126,7 +126,7 @@ jobs:
           echo "Loading squadrun/safe-chain-action@${ref}"
 
       - name: Check out Safe Chain action
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: squadrun/safe-chain-action
           ref: ${{ steps.action-ref.outputs.value }}
