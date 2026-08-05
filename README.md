@@ -91,6 +91,22 @@ sandbox. It does not see:
   package's `postinstall` still executes. Blocking is based on known-bad plus a publication-age
   heuristic, not on behavioural analysis.
 
+### What the self-tests do and don't prove
+
+Worth being precise, since the whole point of this repository is not over-claiming:
+
+- **npm blocking is directly proven.** Aikido publishes an always-flagged canary
+  (`safe-chain-test`); the self-test asserts it is refused *and* absent from disk.
+- **PyPI blocking is not directly proven.** There is no malicious PyPI canary. The self-test
+  proves the weaker, still-essential property: PyPI traffic is genuinely proxied and every
+  package is individually adjudicated. Blocking itself rides on the same proxy and threat feed
+  as the npm path.
+- **The `minimum-package-age-hours` rule keys off release timestamps from Aikido's feed**, not
+  the local clock. You therefore cannot force it to fire on a long-published package by raising
+  the threshold — upstream tests that path with a mock feed server. Treat the 48-hour window as
+  protection against freshly published versions, which is the compromised-maintainer case it is
+  designed for.
+
 Do not read a green check as full supply-chain coverage. Repositories that install from forked
 git repos or unhashed remote tarballs need hash pinning or vendoring, which is a separate problem
 from this one.
