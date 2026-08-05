@@ -141,6 +141,53 @@ jobs:
           uv venv sc-venv
           uv pip install --python sc-venv/bin/python requests==2.32.3
 
+  blocks-too-new-pypi-package:
+    name: blocks too-new PyPI package
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: false
+
+      # Aikido publishes an always-flagged canary for npm but not for PyPI, so
+      # there is no malicious PyPI package to test with. The minimum-package-age
+      # rule exercises the same enforcement path deterministically: set the
+      # threshold absurdly high and every package becomes "too new", so a block
+      # here proves Safe Chain is genuinely inspecting and refusing PyPI traffic
+      # rather than passing it through.
+      - name: Set up Safe Chain with an impossible age threshold
+        uses: ./
+        with:
+          require-shims: "uv"
+          minimum-package-age-hours: "9999999"
+          log-file: ${{ runner.temp }}/safe-chain.log
+
+      - name: Install any PyPI package (must be refused as too new)
+        id: toonew
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          cd "${RUNNER_TEMP}"
+          uv venv age-venv
+          uv pip install --python age-venv/bin/python requests==2.32.3 2>&1 | tee "${RUNNER_TEMP}/toonew.out"
+
+      - name: Assert the package-age rule blocked the install
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.toonew.outcome }}" != "failure" ]; then
+            echo "::error title=Package-age rule did not block::A PyPI install succeeded with minimum-package-age-hours=9999999. Safe Chain is not enforcing on PyPI traffic in this configuration, so uv-based repositories are unprotected. Investigate before shipping."
+            cat "${RUNNER_TEMP}/toonew.out" || true
+            exit 1
+          fi
+          echo "PyPI install correctly refused. Enforcement reaches uv/PyPI traffic."
+
   fails-on-bad-installer-checksum:
     name: fails on bad installer checksum
     runs-on: ubuntu-latest
