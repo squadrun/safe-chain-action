@@ -232,7 +232,7 @@ jobs:
 
       - name: Set up uv
         if: steps.detect.outputs.changed == 'true' && inputs.ecosystem == 'uv'
-        uses: astral-sh/setup-uv@v9.0.0
+        uses: astral-sh/setup-uv@v10.3.2
         with:
           enable-cache: false
 
